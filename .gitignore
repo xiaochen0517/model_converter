@@ -1,2 +1,9 @@
-.venv
-.idea
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+
+# Generated output
+output/
+samples/
