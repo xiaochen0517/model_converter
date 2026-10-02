@@ -37,20 +37,36 @@ model_converter/
 python main.py samples/BeerBottle.X
 
 # 转换整个目录（递归处理所有子目录中的 .x/.X），
-# 输出目录中按相同结构创建子目录，一次 Blender 进程批量处理
+# 输出目录中按相同结构创建子目录；非 .x 文件默认复制到对应位置
 python main.py samples -o output
 
-# 连同非 .x 文件（纹理、说明文档等）一起复制到输出目录对应位置
-python main.py samples -o output --non-x copy
+# 忽略非 .x 文件，不复制
+python main.py samples -o output --non-x ignore
 ```
 
-`--non-x` 控制源目录中非 `.x` 文件的处理方式：
+## 命令行参数
 
-- `ignore`（默认）：忽略，不进行处理
-- `copy`：复制到输出目录中与源目录相同的相对位置
+| 参数 | 说明 |
+| --- | --- |
+| `-o, --output` | 输出目录（默认 `./output`） |
+| `--blender PATH` | `blender.exe` 路径（默认 `C:\Program Files\Blender Foundation\Blender 5.2\blender.exe`）。未指定时依次回退到 `BLENDER_EXE` 环境变量、`Blender Foundation` 目录下其他版本、`PATH`；显式指定但路径不存在则直接报错 |
+| `-j, --jobs N` | 并行 Blender 进程数（默认 CPU 核心数；批量转换时显著加速，内存不足可调小） |
+| `--existing {overwrite,skip}` | 目标文件已存在时的行为：`overwrite` 直接覆盖（默认），`skip` 跳过该文件不转换 |
+| `--non-x {ignore,copy}` | 源目录中非 `.x` 文件的处理：`copy` 复制到输出目录对应位置（默认），`ignore` 忽略 |
 
-转换完成后会输出每个模型的摘要（mesh / skin / animation 数量），用于确认
-动画是否被保留：`skins` 与 `animations` 均 > 0 表示骨骼蒙皮动画已写入 glb。
+转换过程中会在终端显示进度条（仅交互终端）。转换完成后会输出每个模型的
+摘要（mesh / skin / animation 数量），用于确认动画是否被保留：`skins` 与
+`animations` 均 > 0 表示骨骼蒙皮动画已写入 glb。
+
+## 并行转换
+
+默认按 CPU 核心数并行启动多个 headless Blender 进程，每个文件独立转换，
+互不影响（单个文件失败不会中断整体）。可通过 `-j` 调整并行度：
+
+```bash
+# 只开 2 个 Blender 进程（内存受限时）
+python main.py samples -o output -j 2
+```
 
 ## 说明与已知限制
 

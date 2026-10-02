@@ -66,6 +66,7 @@ def convert(src: str, dst: str) -> None:
         use_selection=False,
         export_apply=False,
         export_animations=True,
+        check_existing=False,
     )
 
 

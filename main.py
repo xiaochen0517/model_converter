@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
 
-from converter import BlenderError, convert_files, inspect_glb
+from converter import DEFAULT_BLENDER, BlenderError, convert_files, inspect_glb
 
 
 def _collect_inputs(paths: list[str]) -> list[tuple[Path, Path]]:
@@ -33,7 +34,11 @@ def _collect_inputs(paths: list[str]) -> list[tuple[Path, Path]]:
     return files
 
 
-def _copy_aux_files(roots: list[Path], output_dir: Path) -> list[tuple[Path, Path]]:
+def _copy_aux_files(
+    roots: list[Path],
+    output_dir: Path,
+    skip_existing: bool = False,
+) -> list[tuple[Path, Path]]:
     """Copy non-``.x`` files from input directories into the output tree.
 
     Returns the ``(source, target)`` pairs that were copied.
@@ -43,10 +48,33 @@ def _copy_aux_files(roots: list[Path], output_dir: Path) -> list[tuple[Path, Pat
         for path in sorted(root.rglob("*")):
             if path.is_file() and path.suffix.lower() != ".x":
                 target = output_dir / path.relative_to(root)
+                if skip_existing and target.exists():
+                    continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, target)
                 copied.append((path, target))
     return copied
+
+
+def _print_progress(done: int, total: int) -> None:
+    """Render a carriage-return progress bar on stderr (interactive only)."""
+    if not sys.stderr.isatty():
+        return
+    ratio = done / total if total else 1.0
+    width = 30
+    filled = int(width * ratio)
+    bar = "#" * filled + "-" * (width - filled)
+    sys.stderr.write(f"\r[{bar}] {done}/{total} ({ratio:.0%})")
+    if done >= total:
+        sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
+def _positive_int(raw: str) -> int:
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return value
 
 
 def _report(inspected: dict[str, int]) -> str:
@@ -82,12 +110,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory for generated .glb files (default: ./output).",
     )
     parser.add_argument(
+        "--blender",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=f"Path to blender.exe (default: {DEFAULT_BLENDER}). When not "
+        "given, the search also falls back to the BLENDER_EXE environment "
+        "variable, other Blender Foundation installs, and PATH.",
+    )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=_positive_int,
+        default=os.cpu_count() or 1,
+        metavar="N",
+        help="Number of parallel Blender processes (default: CPU core count).",
+    )
+    parser.add_argument(
+        "--existing",
+        choices=["overwrite", "skip"],
+        default="overwrite",
+        help="What to do when a target file already exists: 'overwrite' "
+        "replaces it (default), 'skip' leaves it and skips conversion.",
+    )
+    parser.add_argument(
         "--non-x",
         choices=["ignore", "copy"],
-        default="ignore",
+        default="copy",
         help="How to handle non-.x files found in input directories: "
-        "'ignore' skips them (default), 'copy' copies them to the "
-        "matching location in the output directory.",
+        "'copy' copies them to the matching location in the output "
+        "directory (default), 'ignore' skips them.",
     )
     return parser
 
@@ -104,16 +156,30 @@ def main(argv: list[str] | None = None) -> int:
         output_dir = Path(args.output)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        skip_existing = args.existing == "skip"
         if args.non_x == "copy":
             roots = [Path(raw) for raw in args.inputs if Path(raw).is_dir()]
-            for source, target in _copy_aux_files(roots, output_dir):
+            for source, target in _copy_aux_files(roots, output_dir, skip_existing):
                 print(f"[copy] {source} -> {target}")
 
-        pairs = [
-            (source, output_dir / rel_dir / f"{source.stem}.glb")
-            for source, rel_dir in inputs
-        ]
-        results = convert_files(pairs)
+        pairs: list[tuple[Path, Path]] = []
+        for source, rel_dir in inputs:
+            target = output_dir / rel_dir / f"{source.stem}.glb"
+            if skip_existing and target.exists():
+                print(f"[skip] {source.name} -> {target} (already exists)")
+                continue
+            pairs.append((source, target))
+
+        if not pairs:
+            print("Nothing to convert: all targets already exist.", file=sys.stderr)
+            return 0
+
+        results = convert_files(
+            pairs,
+            jobs=args.jobs,
+            progress=_print_progress,
+            blender=args.blender,
+        )
 
         targets = {Path(s).resolve(): Path(t).resolve() for s, t in pairs}
         failures = 0

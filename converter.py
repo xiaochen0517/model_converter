@@ -22,6 +22,8 @@ import shutil
 import struct
 import subprocess
 import tempfile
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _BRIDGE_SCRIPT = Path(__file__).resolve().parent / "blender_bridge.py"
@@ -37,13 +39,22 @@ class BlenderError(RuntimeError):
 # --------------------------------------------------------------------------- #
 # Blender discovery & invocation
 # --------------------------------------------------------------------------- #
-def find_blender() -> Path:
+def find_blender(explicit: str | Path | None = None) -> Path:
     """Locate the Blender executable.
 
-    Search order: ``BLENDER_EXE`` environment variable, the default install
-    path, other versions under the standard ``Blender Foundation`` directory,
-    then ``PATH``.
+    ``explicit``, when given, is used as-is and must exist. Otherwise the
+    search order is: ``BLENDER_EXE`` environment variable, the default
+    install path, other versions under the standard ``Blender Foundation``
+    directory, then ``PATH``.
     """
+    if explicit is not None:
+        candidate = Path(explicit)
+        if candidate.is_file():
+            return candidate
+        raise BlenderError(
+            f"blender not found at '{candidate}'. Check the --blender path."
+        )
+
     candidates: list[Path] = []
     env = os.environ.get("BLENDER_EXE")
     if env:
@@ -65,82 +76,103 @@ def find_blender() -> Path:
     )
 
 
-def convert_files(
-    pairs: list[tuple[str | Path, str | Path]],
-    timeout: int = 1800,
-) -> dict[Path, str | None]:
-    """Convert many ``.x`` files in a single Blender process.
+def _convert_one(blender_exe: Path, source: Path, target: Path, timeout: int) -> str | None:
+    """Convert a single ``.x`` file in its own Blender process.
 
-    ``pairs`` is a list of ``(source, target)`` tuples. Returns a dict
-    mapping each source to ``None`` on success or an error message.
+    Returns ``None`` on success or an error message.
     """
-    blender_exe = find_blender()
-    pairs = [(Path(s).resolve(), Path(t).resolve()) for s, t in pairs]
-    for _src, target in pairs:
-        target.parent.mkdir(parents=True, exist_ok=True)
-
     manifest_fd, manifest_path = tempfile.mkstemp(prefix="x2glb_", suffix=".json")
     try:
         with os.fdopen(manifest_fd, "w", encoding="utf-8") as fh:
-            json.dump([[str(s), str(t)] for s, t in pairs], fh)
-
+            json.dump([[str(source), str(target)]], fh)
         proc = subprocess.run(
             [str(blender_exe), "-b", "-P", str(_BRIDGE_SCRIPT), "--", manifest_path],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
+    except subprocess.TimeoutExpired:
+        return f"timed out after {timeout}s"
     except FileNotFoundError:
-        raise BlenderError(
-            f"could not run '{blender_exe}'. Set BLENDER_EXE to a valid blender.exe."
-        ) from None
+        return (
+            f"could not run '{blender_exe}'. "
+            "Set BLENDER_EXE to a valid blender.exe."
+        )
     finally:
         os.unlink(manifest_path)
 
     if proc.returncode != 0:
         tail = "\n".join(proc.stderr.splitlines()[-20:])
-        raise BlenderError(
-            f"blender exited with code {proc.returncode}:\n{tail}"
-        )
+        return f"blender exited with code {proc.returncode}:\n{tail}"
 
-    ok_sources = {
-        Path(parts[1])
-        for line in proc.stdout.splitlines()
-        if line.startswith("BRIDGE_OK\t")
-        and len(parts := line.split("\t", 2)) == 3
-    }
-    errors: dict[Path, str] = {
-        Path(parts[1]): parts[2]
-        for line in proc.stderr.splitlines()
-        if line.startswith("BRIDGE_ERR\t")
-        and len(parts := line.split("\t", 2)) == 3
-    }
+    for line in proc.stderr.splitlines():
+        if line.startswith("BRIDGE_ERR\t") and len(parts := line.split("\t", 2)) == 3:
+            return parts[2]
+
+    if any(line.startswith("BRIDGE_OK\t") for line in proc.stdout.splitlines()):
+        return None
+    return "blender reported no status for this file"
+
+
+def convert_files(
+    pairs: list[tuple[str | Path, str | Path]],
+    jobs: int = 1,
+    timeout: int = 1800,
+    progress: Callable[[int, int], None] | None = None,
+    blender: str | Path | None = None,
+) -> dict[Path, str | None]:
+    """Convert many ``.x`` files, optionally in parallel Blender processes.
+
+    ``pairs`` is a list of ``(source, target)`` tuples. ``jobs`` controls how
+    many Blender processes run concurrently. ``progress``, when given, is
+    called with ``(done, total)`` after each file finishes. ``blender`` is an
+    explicit path to ``blender.exe``; when omitted the executable is located
+    via :func:`find_blender`. Returns a dict mapping each source to ``None``
+    on success or an error message.
+    """
+    blender_exe = find_blender(blender)
+    pairs = [(Path(s).resolve(), Path(t).resolve()) for s, t in pairs]
+    for _src, target in pairs:
+        target.parent.mkdir(parents=True, exist_ok=True)
 
     results: dict[Path, str | None] = {}
-    for src, _target in pairs:
-        if src in errors:
-            results[src] = errors[src]
-        elif src in ok_sources:
-            results[src] = None
-        else:
-            results[src] = "blender reported no status for this file"
+    if jobs <= 1 or len(pairs) <= 1:
+        for done, (source, target) in enumerate(pairs, start=1):
+            results[source] = _convert_one(blender_exe, source, target, timeout)
+            if progress:
+                progress(done, len(pairs))
+        return results
+
+    with ThreadPoolExecutor(max_workers=min(jobs, len(pairs))) as pool:
+        pending = {
+            pool.submit(_convert_one, blender_exe, source, target, timeout): source
+            for source, target in pairs
+        }
+        done = 0
+        for future in as_completed(pending):
+            done += 1
+            results[pending[future]] = future.result()
+            if progress:
+                progress(done, len(pairs))
     return results
 
 
 def convert_x_to_glb(
     input_path: str | Path,
     output_path: str | Path | None = None,
+    blender: str | Path | None = None,
 ) -> Path:
     """Convert a single ``.x`` file to ``.glb`` using Blender.
 
     If ``output_path`` is omitted, the ``.glb`` is written next to the input.
-    Returns the path of the generated file.
+    ``blender`` is an optional explicit path to ``blender.exe``. Returns the
+    path of the generated file.
     """
     source = Path(input_path).resolve()
     target = (Path(output_path) if output_path else source.with_suffix(".glb")).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    results = convert_files([(source, target)])
+    results = convert_files([(source, target)], blender=blender)
     error = results[source]
     if error:
         raise BlenderError(f"{source.name}: {error}")
